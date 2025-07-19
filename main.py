@@ -1,10 +1,13 @@
+import json
 import os
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing_extensions import Dict
+from typing import Any
 import httpx
 from openai import OpenAI
-from openai.types.chat import ChatCompletionToolParam
-import json
 import gradio as gr
+from agents import Agent, FunctionTool, RunContextWrapper, Runner, Tool, trace
 
 
 load_dotenv(override=True)
@@ -16,8 +19,22 @@ smartsuite_account_id = os.getenv("SMARTSUITE_ACCOUNT_ID")
 
 tables = {"CRUD": "687662a8780fb19d5a1277d8", "Blabla": "686e6d12db86cd32da256d86"}
 
+class CreateRecordArgs(BaseModel):
+    tableId: str
+    fields: Dict[str, Any]
 
-def get_table(tableId):
+class GetTableArgs(BaseModel):
+    tableId: str
+
+class UrlBuilderArgs(BaseModel):
+    application_id: str
+    id: str
+
+async def run_get_table_tool(context: RunContextWrapper[Any], args_json: str) -> str:
+    args = GetTableArgs.model_validate_json(args_json)
+    tableId = args.tableId
+    print(f"tableId: {context}")
+    print(f"args: {args}")
     url = f"https://app.smartsuite.com/api/v1/applications/{tableId}/"
     headers = {
         "Authorization": f"Token {smartsuite_api_key}",
@@ -28,25 +45,70 @@ def get_table(tableId):
     response.raise_for_status()
     return response.json()
 
+get_table_tool = FunctionTool(
+    name="get_table",
+    description="Get the table and it's fields information.",
+    params_json_schema=GetTableArgs.model_json_schema(),
+    on_invoke_tool=run_get_table_tool,
+    strict_json_schema=False
+)
 
-def create_record(tableId, fields):
-    print(f"fields: {fields}")
+async def run_create_record_tool(context: RunContextWrapper[Any], args_json: str) -> str:
+    args = CreateRecordArgs.model_validate_json(args_json)
+    print(f"args: {args}")
+    print(f"context: {context}")
+    tableId = args.tableId
+    fields = args.fields
+    print(json.dumps(fields, indent=4))
+    # Mock SmartSuite request — replace with your actual API logic
     url = f"https://app.smartsuite.com/api/v1/applications/{tableId}/records/"
     headers = {
         "Authorization": f"Token {smartsuite_api_key}",
         "ACCOUNT-ID": smartsuite_account_id,
-        "content-type": "application/json",
+        "Content-Type": "application/json"
     }
-    response = httpx.post(url, headers=headers, content=json.dumps(fields))
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        response = httpx.post(url, headers=headers, content=json.dumps(fields))
+        print(f"response: {response.json()}")
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        message = str(e)
+        return f"Failed to create record: {message}"
+
+create_record_tool = FunctionTool(
+    name="create_record",
+    description="Create a SmartSuite record in a specified table with dynamic fields.",
+    params_json_schema=CreateRecordArgs.model_json_schema(),
+    on_invoke_tool=run_create_record_tool,
+    strict_json_schema=False
+)
+
+async def run_url_builder_tool(context: RunContextWrapper[Any], args_json: str) -> str:
+    args = UrlBuilderArgs.model_validate_json(args_json)
+    tableId = args.application_id
+    recordId = args.id
+    print(f"args: {args}")
+    print(f"context: {context}")
+    return f"https://app.smartsuite.com/{smartsuite_account_id}/solution/68110662fc8e5e3d8678d825/{tableId}?editRecord={recordId}"
+
+url_builder_tool = FunctionTool(
+    name="url_builder",
+    description="Build the url of the created record.",
+    params_json_schema=UrlBuilderArgs.model_json_schema(),
+    on_invoke_tool=run_url_builder_tool,
+    strict_json_schema=False
+)
+
+
 
 
 system_prompt = f"""You are a SmartSuite assistant that performs Create Record operations.
 You will create a record based on the user's request using the following tables: {tables}.
 
 Before creating a record:
-- Retrieve the fields of the specified table.
+- Retrieve the fields of the specified table using the get_table tool.
 - Map the user's input to the appropriate fields.
 
 When calling the `create_record` function:
@@ -55,9 +117,19 @@ When calling the `create_record` function:
 - Only keep `tableId` at the top level
 - use the slugs in fields as it is case sensitive
 
+When record is created successfully:
+- Build the url of the created record using the url_builder tool
+- application_id is the id of the table
+- id is the id of the created record from create_record tool response
+- Return the url of the created record.
+
 If no matching field label is found:
 - Create a new field.
-- Set its label and value based on the user's input.\n
+- Set its label and value based on the user's input.
+
+If an error occurs while creating the record:
+- Extract the error message from the response.
+- Respond with a human-friendly explanation of the error.\n
 """
 
 system_prompt += """
@@ -116,103 +188,23 @@ curl -X POST https://app.smartsuite.com/api/v1/applications/646536cac79b49252b0f
 
 """
 
-tools: list[ChatCompletionToolParam] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_table",
-            "description": "Get the table and it's fields information",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tableId": {
-                        "type": "string",
-                        "description": "The ID of the table (application) to fetch records or fields from.",
-                    }
-                },
-                "required": ["tableId"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_record",
-            "description": "Create a record in a given table",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tableId": {
-                        "type": "string",
-                        "description": "The ID of the table (application) to create a record in.",
-                    },
-                    "fields": {
-                        "type": "object",
-                        "description": "The fields of the record to create. The fields are the same as the fields of the table.",
-                    },
-                },
-                "required": ["tableId", "fields"],
-            },
-        },
-    },
-]
+smartsuite_create_agent_tools: list[Tool] = [get_table_tool, create_record_tool, url_builder_tool]
 
-def handle_tool_calls(tool_calls):
-    results = []
-    for tool_call in tool_calls:
-        name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments)
-        print(f"arguments: {arguments}")
-        print(f"Tool called: {name}", flush=True)
-        if name == "get_table":
-            result = get_table(**arguments)
-            results.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(result)
-            })
-        elif name == "create_record":
-            result = create_record(**arguments)
-            results.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": json.dumps(result)
-            })
-    return results
+smartsuite_create_agent = Agent(name="SmartSuite Create Agent", instructions=system_prompt, tools=smartsuite_create_agent_tools)
 
+async def chat(user_message, history):
+    with trace("Create Record"):
+        response = await Runner.run(smartsuite_create_agent, user_message)
+        return response.final_output
 
-
-
-def chat(user_message, history):
-    print(f"history: {history}")
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_message}]
-    done = False
-    while not done:
-
-        response = openai.chat.completions.create(model="gpt-4.1", messages=messages, tools=tools, tool_choice="auto")
-
-        finish_reason = response.choices[0].finish_reason
-        
-        # If the LLM wants to call a tool, we do that!
-        print(f"finish_reason: {finish_reason}")
-         
-        if finish_reason=="tool_calls":
-            message = response.choices[0].message
-            print(message)
-            tool_calls = message.tool_calls
-            results = handle_tool_calls(tool_calls)
-            messages.append(message)
-            messages.extend(results)
-        else:
-            done = True  
-    print(f"response: {response}")
-    return response.choices[0].message.content
 
 
 def main():
     gr.ChatInterface(fn=chat, title="HypePilot SmartSuite Assistant", type="messages").launch()
 
+
+
+import asyncio
 
 if __name__ == "__main__":
     main()
